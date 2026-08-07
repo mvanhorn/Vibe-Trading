@@ -25,6 +25,15 @@ DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "vibe-trading"
 
 
+class CodexStreamError(RuntimeError):
+    """Typed, non-retryable error returned by the Codex streaming endpoint."""
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.retryable = False
+        super().__init__(f"OpenAI Codex HTTP {status_code}: {body[:500]}")
+
+
 @dataclass
 class CodexToolCall:
     """Internal tool-call representation compatible with ChatLLM parsing."""
@@ -69,17 +78,10 @@ def login_openai_codex(
 ) -> Any:
     """Run interactive ChatGPT/Codex OAuth login and persist the token."""
     try:
-        from oauth_cli_kit import get_token, login_oauth_interactive
+        from oauth_cli_kit import login_oauth_interactive
     except ImportError as exc:
         raise RuntimeError("oauth-cli-kit is not installed. Run: pip install oauth-cli-kit") from exc
 
-    token = None
-    try:
-        token = get_token()
-    except Exception:
-        pass
-    if token and getattr(token, "access", None):
-        return token
     return login_oauth_interactive(print_fn=print_fn or print, prompt_fn=prompt_fn or input)
 
 
@@ -399,7 +401,7 @@ class OpenAICodexLLM:
             with client.stream("POST", self.codex_url, headers=self._headers(), json=self._body(messages, stream=True)) as response:
                 if response.status_code != 200:
                     raw = response.read().decode("utf-8", "ignore")
-                    raise RuntimeError(f"OpenAI Codex HTTP {response.status_code}: {raw[:500]}")
+                    raise CodexStreamError(response.status_code, raw)
                 yield from _message_chunks_from_events(_events_from_lines(response.iter_lines()))
 
     def invoke(self, messages: list[dict[str, Any]], config: Optional[dict[str, Any]] = None) -> CodexAIMessage:

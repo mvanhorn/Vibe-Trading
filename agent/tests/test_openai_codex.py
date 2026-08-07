@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from src.providers import llm as llm_mod
 from src.providers.openai_codex import (
+    CodexStreamError,
     DEFAULT_CODEX_URL,
     OpenAICodexLLM,
     _events_from_lines,
     _message_chunks_from_events,
     _strip_model_prefix,
+    login_openai_codex,
     validate_codex_base_url,
 )
 
@@ -48,6 +52,53 @@ def test_build_llm_returns_codex_adapter(monkeypatch: pytest.MonkeyPatch) -> Non
     assert adapter.model == DEFAULT_CODEX_MODEL
 
 
+def test_login_reauthenticates_when_cached_token_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    cached_token = SimpleNamespace(access="invalidated-token", account_id="cached-account")
+    replacement_token = SimpleNamespace(access="replacement-token", account_id="replacement-account")
+    interactive_calls: list[tuple[object, object]] = []
+
+    def _interactive_login(*, print_fn: object, prompt_fn: object) -> object:
+        interactive_calls.append((print_fn, prompt_fn))
+        return replacement_token
+
+    oauth_cli_kit = SimpleNamespace(
+        get_token=lambda: cached_token,
+        login_oauth_interactive=_interactive_login,
+    )
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", oauth_cli_kit)
+
+    token = login_openai_codex()
+
+    assert token is replacement_token
+    assert interactive_calls == [(print, input)]
+
+
+def test_login_without_cached_token_uses_supplied_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    replacement_token = SimpleNamespace(access="replacement-token", account_id="replacement-account")
+    interactive_calls: list[tuple[object, object]] = []
+
+    def _print(message: str) -> None:
+        pass
+
+    def _prompt(prompt: str) -> str:
+        return "response"
+
+    def _interactive_login(*, print_fn: object, prompt_fn: object) -> object:
+        interactive_calls.append((print_fn, prompt_fn))
+        return replacement_token
+
+    oauth_cli_kit = SimpleNamespace(
+        get_token=lambda: None,
+        login_oauth_interactive=_interactive_login,
+    )
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", oauth_cli_kit)
+
+    token = login_openai_codex(print_fn=_print, prompt_fn=_prompt)
+
+    assert token is replacement_token
+    assert interactive_calls == [(_print, _prompt)]
+
+
 def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
     adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
 
@@ -76,19 +127,26 @@ def test_codex_body_strips_provider_prefix_and_converts_tools() -> None:
 
 
 def test_missing_codex_token_raises_login_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    oauth_cli_kit = pytest.importorskip(
-        "oauth_cli_kit",
-        reason="oauth-cli-kit is declared in requirements.txt but optional at runtime",
-    )
-
     def _missing_token() -> None:
         raise RuntimeError("missing")
 
-    monkeypatch.setattr(oauth_cli_kit, "get_token", _missing_token)
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", SimpleNamespace(get_token=_missing_token))
     adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
 
     with pytest.raises(RuntimeError, match="vibe-trading provider login openai-codex"):
         adapter._headers()
+
+
+def test_codex_headers_use_persisted_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    oauth_cli_kit = SimpleNamespace(
+        get_token=lambda: SimpleNamespace(access="persisted-token", account_id="account-123"),
+    )
+    monkeypatch.setitem(sys.modules, "oauth_cli_kit", oauth_cli_kit)
+
+    headers = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)._headers()
+
+    assert headers["Authorization"] == "Bearer persisted-token"
+    assert headers["chatgpt-account-id"] == "account-123"
 
 
 def test_sse_events_parse_text_and_function_calls() -> None:
@@ -113,7 +171,7 @@ def test_sse_events_parse_text_and_function_calls() -> None:
     assert chunks[1].tool_calls == [{"id": "call_1|fc_1", "name": "bash", "args": {"command": "pwd"}}]
 
 
-def test_stream_non_200_response_raises_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stream_401_response_raises_non_retryable_codex_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeResponse:
         status_code = 401
 
@@ -145,5 +203,8 @@ def test_stream_non_200_response_raises_http_error(monkeypatch: pytest.MonkeyPat
     adapter = OpenAICodexLLM(model=DEFAULT_CODEX_MODEL)
     adapter._headers = lambda: {}
 
-    with pytest.raises(RuntimeError, match="OpenAI Codex HTTP 401"):
+    with pytest.raises(CodexStreamError, match="OpenAI Codex HTTP 401") as exc_info:
         list(adapter.stream([{"role": "user", "content": "hello"}]))
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.retryable is False
